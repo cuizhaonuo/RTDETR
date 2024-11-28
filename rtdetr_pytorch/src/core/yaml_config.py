@@ -15,6 +15,7 @@ class YAMLConfig(BaseConfig):
     def __init__(self, cfg_path: str, **kwargs) -> None:
         super().__init__()
 
+        # 加载配置文件中的参数，合并参数列表传入的键值对参数
         cfg = load_config(cfg_path)
         merge_dict(cfg, kwargs)
 
@@ -40,6 +41,7 @@ class YAMLConfig(BaseConfig):
     @property
     def model(self, ) -> torch.nn.Module:
         if self._model is None and 'model' in self.yaml_cfg:
+            # 将 yaml 归并后的 cfg 中的参数归并到 GLOBAL_CONFIG，此时包含全部类的相关信息与全部配置文件的信息
             merge_config(self.yaml_cfg)
             self._model = create(self.yaml_cfg['model'])
         return self._model 

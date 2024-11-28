@@ -106,8 +106,13 @@ class CSPRepLayer(nn.Module):
             self.conv3 = nn.Identity()
 
     def forward(self, x):
+        # 主干
+        # (2, 512, 36, 36) --> (2, 256, 36, 36)
         x_1 = self.conv1(x)
+        # (2, 256, 36, 36) --> 1x1 3x1 + (2, 256, 36)
         x_1 = self.bottlenecks(x_1)
+        # 侧支
+        # （2, 512, 36, 36) --> (2, 256, 36, 36)
         x_2 = self.conv2(x)
         return self.conv3(x_1 + x_2)
 
@@ -145,6 +150,10 @@ class TransformerEncoderLayer(nn.Module):
         if self.normalize_before:
             src = self.norm1(src)
         q = k = self.with_pos_embed(src, pos_embed)
+        # src, _ 即 attn_output, attn_output_weights，形状分别为 (L, N, E), (N, L, S) / (N, L, E), (N, L, S)
+        # L 是 query 的序列长度，S 是 key 的序列长度，N 是批次大小，E 是嵌入维度 (embed_dim)
+        # 前者是多头注意力的输出，是经过注意力计算和线性变换后的结果，后者是注意力权重矩阵，表示注意力计算过程中每个 query 和 key 之间的权重
+        # attn_output_weights 这个矩阵通常用于可视化注意力权重，分析模型的关注点。
         src, _ = self.self_attn(q, k, value=src, attn_mask=src_mask)
 
         src = residual + self.dropout1(src)
@@ -233,9 +242,11 @@ class HybridEncoder(nn.Module):
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
         self.fpn_blocks = nn.ModuleList()
+        # [2, 1]
         for _ in range(len(in_channels) - 1, 0, -1):
             self.lateral_convs.append(ConvNormLayer(hidden_dim, hidden_dim, 1, 1, act=act))
             self.fpn_blocks.append(
+                # 512, 256, 3, 'silu', 1
                 CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
             )
 
@@ -281,42 +292,75 @@ class HybridEncoder(nn.Module):
         return torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
 
     def forward(self, feats):
+        # feats[List] 从 Backbone 中提取出三个特征层，通道数分别为 512 1024 2048
+        # (b, 512, H/8, W/8), (b, 1024, H/16, W/16), (b, 2048, H/32, W/32)
+        # (2, 3, 576, 576) 输入图片
+        # [(2, 512, 72, 72), (2, 1024, 36, 36), (2, 2048, 18, 18)] 特征层
+        # [512, 1024, 2048]
         assert len(feats) == len(self.in_channels)
+        # 将三个特征层的通道数进行统一，方便后续的特征层融合
+        # [(2, 256, 72, 72), (2, 256, 36, 36), (2, 256, 18, 18)]
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
-        
+
+        # AIFI
         # encoder
+        # RT-DETR AIFI 的 encoder 只有一层，DETR 的 encoder 则有 6 层
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
                 h, w = proj_feats[enc_ind].shape[2:]
                 # flatten [B, C, H, W] to [B, HxW, C]
+                # (2, 256, 18, 18) --> (2, 256, 324) --> (2, 324, 256)
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
                 if self.training or self.eval_spatial_size is None:
+                    # (2, 324, 256)
                     pos_embed = self.build_2d_sincos_position_embedding(
                         w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
                 else:
                     pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
-
+                # (2, 324, 256)
                 memory = self.encoder[i](src_flatten, pos_embed=pos_embed)
+                # (2, 324, 256) --> (2, 256, 324) --> (2, 256, 18, 18)
+                # 经过 encoder 编码后的特征层形状不变，覆盖未编码的特征层
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
                 # print([x.is_contiguous() for x in proj_feats ])
 
+        # CCFM = FPN + PAN
         # broadcasting and fusion
+        # [(2, 256, 72, 72), (2, 256, 36, 36), (2, 256, 18, 18)]
+        # [(2, 256, 18, 18)]
         inner_outs = [proj_feats[-1]]
+        # [512, 1024, 2048] --> range: [2, 1] --> idx - 1: [1, 0]
+        # upsample 路径，18 -> 36 -> 72
         for idx in range(len(self.in_channels) - 1, 0, -1):
+            # (2, 256, 18, 18)
             feat_high = inner_outs[0]
+            # (2, 256, 36, 36)
             feat_low = proj_feats[idx - 1]
+            # 经过 1x1 卷积 (2, 256, 18, 18)
+            # len(self.in_channels) - 1 - idx, 减去 idx，将倒序转化为正序索引 [2, 1] - [2, 1] --> [0, 1]
             feat_high = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_high)
             inner_outs[0] = feat_high
+            # 双线性插值，上采样 2 倍，(2, 256, 18, 18) --> (2, 256, 36, 36)
             upsample_feat = F.interpolate(feat_high, scale_factor=2., mode='nearest')
+            # (2, 256, 36, 36) --> concat (2, 512, 36, 36) --> CSPRepLayer RepVGGBlock (2, 256, 36, 36)
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
+            # [(2, 256, 18, 18)] --> [(2, 256, 36, 36), (2, 256, 18, 18)]
             inner_outs.insert(0, inner_out)
 
+        # [(2, 256, 72, 72), (2, 256, 36, 36), (2, 256, 18, 18)]，其中 (2, 256, 18, 18) 是未经过融合的特征层
+        # [(2, 256, 72, 72)]
         outs = [inner_outs[0]]
+        # range: [0, 1] --> idx + 1: [1, 2]
         for idx in range(len(self.in_channels) - 1):
+            # (2, 256, 72, 72)
             feat_low = outs[-1]
+            # (2, 256, 36, 36)
             feat_high = inner_outs[idx + 1]
+            # 步长为 2 的卷积核，下采样 2 倍，(2, 256, 72, 72) --> (2, 256, 36, 36)
             downsample_feat = self.downsample_convs[idx](feat_low)
+            # (2, 256, 36, 36) --> concat (2, 512, 36, 36) --> CSPPepLayer RepVGGBlock (2, 256, 36, 36)
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_high], dim=1))
+            # [(2, 256, 72, 72), (2, 256, 36, 36)]
             outs.append(out)
-
+        # [(2, 256, 72, 72), (2, 256, 36, 36), (2, 256, 18, 18)]
         return outs
